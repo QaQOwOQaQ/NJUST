@@ -42,20 +42,19 @@ public:
 
     bool try_lock() {
         std::thread::id this_id = std::this_thread::get_id();
-        std::unique_lock<std::mutex> lock(mtx_, std::try_to_lock);
-        if(!lock.owns_lock())   return false;
-        // 无人持锁
-        if(cnt_ == 0) {
+        // 必须阻塞获取内部锁，以准确读取状态
+        std::lock_guard<std::mutex> lock(mtx_); 
+        
+        if (cnt_ == 0) {
             owner_ = this_id;
             cnt_ = 1;
             return true;
         }
-        // 自己持锁
-        if(owner_ == this_id) {
-            ++ cnt_;
+        if (owner_ == this_id) {
+            // 检查溢出（见下文）
+            ++cnt_;
             return true;
         }
-        // 它人持锁
         return false;
     }
 
@@ -71,7 +70,10 @@ public:
     template<typename Clock, typename Duration> 
     bool try_lock_until(const std::chrono::time_point<Clock, Duration>& timeout_time) {
         std::thread::id this_id = std::this_thread::get_id();
-        std::unique_lock<std::mutex> lock(mtx_);
+        std::unique_lock<std::mutex> lock(mtx_, std::defer_lock);
+        
+        // 尝试在 timeout_time 之前拿到 mtx_ 本身
+        if(!lock.try_lock_until(timeout_time))  return false;
 
         bool ready = cond_.wait_until(lock, timeout_time, [&]{
             return (cnt_ == 0) || (owner_ == this_id);
