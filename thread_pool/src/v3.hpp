@@ -1,8 +1,6 @@
 #ifndef THREAD_POOL_V2_H
 #define THREAD_POOL_V2_H 
 
-#include "SafeQueue.tpp"
-
 #include <functional>
 #include <future>
 #include <stdexcept>
@@ -12,6 +10,8 @@
 #include <memory>
 #include <type_traits>
 #include <atomic>
+
+#include "SafeQueue.hpp"
 
 class ThreadPool {
     using Job = std::function<void()>;

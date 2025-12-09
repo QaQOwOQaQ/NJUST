@@ -1,8 +1,6 @@
 #ifndef SAFE_BLOCKING_QUEUE_H
 #define SAFE_BLOCKING_QUEUE_H
 
-
-
 #include <queue>
 #include <mutex>
 #include <condition_variable>

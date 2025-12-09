@@ -13,7 +13,7 @@
 #include <mutex>
 #include <memory>
 
-#include "SafeQueue.tpp"
+#include "SafeQueue.hpp"
 
 class ThreadPool {
 public: 
