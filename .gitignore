@@ -1,9 +1,13 @@
+app
 *.app 
 *_app
+
 
 *.i
 *.o
 *.s
+
+bin/
 
 *.out
 *_out

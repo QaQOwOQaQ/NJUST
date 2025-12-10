@@ -1,0 +1,4 @@
+<map id="demo::util::ScopeGuard" name="demo::util::ScopeGuard">
+<area shape="rect" id="node1" title="作用域守卫：确保作用域退出时执行清理" alt="" coords="5,109,180,136"/>
+<area shape="rect" id="node2" href="$structdemo_1_1util_1_1ScopeGuard_1_1Concept.html" title=" " alt="" coords="5,5,180,47"/>
+</map>
