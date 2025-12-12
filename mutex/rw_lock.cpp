@@ -15,6 +15,7 @@
 #include <vector>
 #include <algorithm>
 #include <barrier>
+#include <cassert>
 
 using namespace std::chrono;
 
@@ -30,49 +31,43 @@ public:
     shared_mutex& operator=(const shared_mutex&) = delete;
 
     void lock() {
-        std::unique_lock<std::mutex> lk(m_);
-        cv_.wait(lk, [&]{ return !writer_active_ && active_readers_ == 0; });
-        writer_active_ = true;
+        std::unique_lock<std::mutex> lock(mtx_);
+        cond_.wait(lock, [&]{ return !has_writer_ && reader_cnt_ == 0; });
+        has_writer_ = true;
     }
-
     bool try_lock() {
-        std::lock_guard<std::mutex> lk(m_);
-        if (writer_active_ || active_readers_ != 0) return false;
-        writer_active_ = true;
-        return true;
+        std::unique_lock<std::mutex> lock(mtx_);
+        if(!has_writer_ && reader_cnt_ == 0) {
+            has_writer_ = true;
+            return true;
+        }
+        return false;
     }
-
     void unlock() {
-        std::lock_guard<std::mutex> lk(m_);
-        writer_active_ = false;
-        cv_.notify_all();
+        std::unique_lock<std::mutex> lock(mtx_);
+        has_writer_ = false;
+        cond_.notify_all();
     }
-
     void lock_shared() {
-        std::unique_lock<std::mutex> lk(m_);
-        // reader preference: as long as no active writer, new readers can come in
-        cv_.wait(lk, [&]{ return !writer_active_; });
-        ++active_readers_;
+        std::unique_lock<std::mutex> lock(mtx_);
+        cond_.wait(lock, [&]{ return !has_writer_; });
+        ++ reader_cnt_;
     }
-
     bool try_lock_shared() {
-        std::lock_guard<std::mutex> lk(m_);
-        if (writer_active_) return false;
-        ++active_readers_;
+        std::unique_lock<std::mutex> lock(mtx_);
+        if(has_writer_) return false;
+        ++ reader_cnt_;
         return true;
     }
-
     void unlock_shared() {
-        std::lock_guard<std::mutex> lk(m_);
-        --active_readers_;
-        if (active_readers_ == 0) cv_.notify_all();
+        std::unique_lock<std::mutex> lock(mtx_);
+        if( -- reader_cnt_ == 0) cond_.notify_all();
     }
-
 private:
-    std::mutex m_;
-    std::condition_variable cv_;
-    int active_readers_ = 0;
-    bool writer_active_ = false;
+    std::mutex mtx_;
+    std::condition_variable cond_;
+    bool has_writer_{false};
+    int reader_cnt_{0};
 };
 
 } // namespace reader_pref
@@ -89,52 +84,44 @@ public:
     shared_mutex& operator=(const shared_mutex&) = delete;
 
     void lock() {
-        std::unique_lock<std::mutex> lk(m_);
-        ++waiting_writers_;
-        cv_.wait(lk, [&]{ return !writer_active_ && active_readers_ == 0; });
-        --waiting_writers_;
-        writer_active_ = true;
+        std::unique_lock<std::mutex> lock(mtx_);
+        ++ writer_waiter_;
+        cond_.wait(lock, [&]{ return !has_writer_ && reader_cnt_ == 0; });
+        -- writer_waiter_;
+        has_writer_ = true;
     }
-
     bool try_lock() {
-        std::lock_guard<std::mutex> lk(m_);
-        if (writer_active_ || active_readers_ != 0) return false;
-        writer_active_ = true;
+        std::unique_lock<std::mutex> lock(mtx_);
+        if(has_writer_ || reader_cnt_ != 0) return false;
+        has_writer_ = true;
         return true;
     }
-
     void unlock() {
-        std::lock_guard<std::mutex> lk(m_);
-        writer_active_ = false;
-        cv_.notify_all();
+        std::unique_lock<std::mutex> lock(mtx_);
+        has_writer_ = false;
+        cond_.notify_all();
     }
-
     void lock_shared() {
-        std::unique_lock<std::mutex> lk(m_);
-        // writer preference: if any writer is waiting, block new readers
-        cv_.wait(lk, [&]{ return !writer_active_ && waiting_writers_ == 0; });
-        ++active_readers_;
+        std::unique_lock<std::mutex> lock(mtx_);
+        cond_.wait(lock, [&]{ return !has_writer_ && writer_waiter_ == 0; });
+        ++ reader_cnt_;
     }
-
     bool try_lock_shared() {
-        std::lock_guard<std::mutex> lk(m_);
-        if (writer_active_ || waiting_writers_ != 0) return false;
-        ++active_readers_;
+        std::unique_lock<std::mutex> lock(mtx_);
+        if(has_writer_ || writer_waiter_ != 0) return false;
+        ++ reader_cnt_;
         return true;
     }
-
     void unlock_shared() {
-        std::lock_guard<std::mutex> lk(m_);
-        --active_readers_;
-        if (active_readers_ == 0) cv_.notify_all();
+        std::unique_lock<std::mutex> lock(mtx_);
+        if( -- reader_cnt_ == 0) cond_.notify_all();
     }
-
 private:
-    std::mutex m_;
-    std::condition_variable cv_;
-    int active_readers_ = 0;
-    int waiting_writers_ = 0;
-    bool writer_active_ = false;
+    std::mutex mtx_;
+    std::condition_variable cond_;
+    bool has_writer_{false};
+    int writer_waiter_{0};
+    int reader_cnt_{0};
 };
 
 } // namespace writer_pref
@@ -144,6 +131,11 @@ private:
 // ============================================================
 namespace fair_fifo {
 
+#define COMPLEX_FIFO_SHARED_MUTEX
+
+#if defined(SIMPLE_FIFO_SHARED_MUTEX)
+
+// 一个简单的，基于 FIFO 思想的公平读写锁
 class shared_mutex {
 public:
     shared_mutex() = default;
@@ -259,7 +251,202 @@ private:
     // how many readers are permitted in the current FIFO head batch
     int reader_batch_remaining_ = 0;
 };
+#else 
 
+// 基于 FIFO 思想的读写锁
+// 相较于上一份代码，在唤醒时不在 notify_all 广播，
+// 而是给每个等待线程一个私有闸门（私有 cond），调度器只打开该打开的闸门
+// 主要理解 lock() 和 lock_shared()
+
+class shared_mutex {
+public:
+    shared_mutex() = default;
+    shared_mutex(const shared_mutex&) = delete;
+    shared_mutex& operator=(const shared_mutex&) = delete;
+
+    // ==========================================
+    // 独占锁 (Writer)
+    // ==========================================
+    void lock() {
+        Waiter w; // 创建一个当前等待调度的对象
+        std::unique_lock<std::mutex> lk(mtx_);
+
+        const std::uint64_t my_ticket = next_ticket_++;
+        q_.push_back(Node{Mode::Write, my_ticket, &w});
+
+        // 入队后尝试触发调度（尤其是队列原本为空时）
+        wake_next_();
+
+        // 仅在被“精准唤醒”后继续
+        w.cv.wait(lk, [&]{ return w.go; });
+
+        // 断言：当前唤醒节点为对头写者节点
+        assert(!q_.empty() && q_.front().mode == Mode::Write);
+        assert(q_.front().ticket == my_ticket);
+
+        // 写者获取锁：自己出队
+        q_.pop_front();
+        has_writer_ = true;
+    }
+
+    bool try_lock() {
+        std::unique_lock<std::mutex> lk(mtx_);
+
+        // 没有正在进行的写者
+        // 没有正在进行的或等待进行的读者
+        // 不能插队
+        if (has_writer_) return false;
+        if (reader_cnt_ != 0 || pending_readers_ != 0) return false;
+        if (!q_.empty()) return false;             // 严格公平：有人排队就不能抢
+
+        has_writer_ = true;
+        return true;
+    }
+
+    void unlock() {
+        std::unique_lock<std::mutex> lk(mtx_);
+        has_writer_ = false;
+        wake_next_();
+    }
+
+    // ==========================================
+    // 共享锁 (Reader)
+    // ==========================================
+    void lock_shared() {
+        Waiter w;
+        std::unique_lock<std::mutex> lk(mtx_);
+
+        const std::uint64_t my_ticket = next_ticket_++;
+        q_.push_back(Node{Mode::Read, my_ticket, &w});
+
+        // 入队后尝试触发调度（尤其是队列原本为空时）
+        wake_next_();
+
+        // 等待被批次调度“精准唤醒”
+        w.cv.wait(lk, [&]{ return w.go; });
+
+        // 注意读者无法在这里断言，因为节点 node 已经在批量出中被处理了
+        // assert(!q_.empty() && q_.front().mode == Mode::Read);
+        // assert(q_.front().ticket == my_ticket);
+
+        // 读者正式入场
+        ++ reader_cnt_;
+        -- pending_readers_;
+
+        // 不需要 wake_next_：因为只要 reader_cnt_ > 0 写者就不能跑
+    }
+
+    bool try_lock_shared() {
+        std::unique_lock<std::mutex> lk(mtx_);
+
+        // 不能有正在写的线程
+        // 不能有未完成的读
+        // 不能插队
+        if (has_writer_) return false;
+        if (pending_readers_ != 0) return false;   // 有批次在“入场中”，视为忙
+        if (!q_.empty()) return false;             // 严格公平：有人排队就不能抢
+
+        ++ reader_cnt_;
+        return true;
+    }
+
+    void unlock_shared() {
+        std::unique_lock<std::mutex> lk(mtx_);
+        if (--reader_cnt_ == 0) {
+            wake_next_(); // 若仍有 pending_readers_，wake_next_ 会自动不放行写者
+        }
+    }
+
+private:
+    enum class Mode { Read, Write };
+
+    struct Waiter {
+        std::condition_variable cv; // 通知信号：唤醒线程
+        bool go{false}; // 状态位：线程醒来后检查自己是不是真的被允许通过
+                        // 可以防止伪唤醒和“先 notify，后 wait 导致通知信号丢失的情况”
+    };
+
+    struct Node {
+        Mode mode;
+        std::uint64_t ticket; 
+        Waiter* waiter;       // Read/Write 都用私有 waiter；try_lock* 不入队则无 waiter
+    };
+
+    // 注意：以下 *_unsafe_ 仅在已持有 mtx_ 时调用
+    bool can_run_writer_unsafe_() const {
+        // 没有正在进行的写
+        // 没有正在进行或等待进行的读
+        // 可以写
+        return !has_writer_
+            && reader_cnt_ == 0 && pending_readers_ == 0
+            && !q_.empty() && q_.front().mode == Mode::Write;
+    }
+
+    // 开启读批次：弹出队头连续 Read，并仅唤醒这一批读者（无 notify_all 惊群）
+    void open_read_batch_and_wake_unsafe_() {
+        std::vector<Waiter*> to_wake;
+        to_wake.reserve(32);
+
+        std::size_t count = 0;
+        while (!q_.empty() && q_.front().mode == Mode::Read) {
+            Waiter* w = q_.front().waiter;
+            q_.pop_front();
+            if (w) {
+                to_wake.push_back(w);
+            }
+            ++ count;
+        }
+
+        // 标记：已批准但尚未入场的读者数
+        pending_readers_ = count;
+
+        // 精准唤醒该批次的读者（每个读者一个 notify_one）
+        for (Waiter* w : to_wake) {
+            w->go = true;
+            w->cv.notify_one();
+        }
+    }
+
+    // 核心调度器：所有调用都在持有 mtx_ 的情况下进行
+    void wake_next_() {
+        // 1) 有人在持锁：不调度
+        if (has_writer_ || reader_cnt_ != 0) return;
+
+        // 2) 读批次“入场中”：不调度写者/下一批
+        if (pending_readers_ != 0) return;
+
+        // 3) 队列空：结束
+        if (q_.empty()) return;
+
+        // 4) 按队头调度
+        if (q_.front().mode == Mode::Write) {
+            // 精准唤醒队头写者（无惊群）
+            Waiter* w = q_.front().waiter;
+            if (w) {
+                w->go = true;
+                w->cv.notify_one();
+            }
+        } else {
+            // 开启读批次并精准唤醒该批次读者（无 notify_all 惊群）
+            open_read_batch_and_wake_unsafe_();
+        }
+    }
+
+private:
+    std::mutex mtx_;
+    std::deque<Node> q_;
+
+    bool has_writer_{false};
+    std::size_t reader_cnt_{0};      // 已经入场的读者
+    std::size_t pending_readers_{0}; // 已经批准（被唤醒）但尚未完成“入场”的读者数量
+    
+    std::uint64_t next_ticket_{0};   // 等待线程的票号
+                                     // ticket 在这里无实际价值，它仅用于辅助用途
+                                     //     1. 调试/日志/可观察性：打印 ticket 能查看入队/出队/排队情况
+                                     //     2. 防御性校验：等待线程醒来后断言“我真的是对头那个节点对应的线程”，可以在开发期更早的发现 bug
+};
+
+#endif
 } // namespace fair_fifo
 
 
@@ -268,8 +455,8 @@ private:
 // ============================================================
 
 // #define READER_PREF  
-#define WRITER_PREF
-// #define FAIR_FIFO 
+// #define WRITER_PREF
+#define FAIR_FIFO 
 
 
 #if defined(FAIR_FIFO)

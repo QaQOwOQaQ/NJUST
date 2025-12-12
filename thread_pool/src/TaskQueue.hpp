@@ -14,7 +14,6 @@
 #include <chrono>
 #include <list>
 #include <map>
-#include <list>
 #include <algorithm>
 #include <type_traits>
 #include <stdexcept>
